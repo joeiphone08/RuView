@@ -290,7 +290,9 @@ class SensingService {
    */
   _applyServerSource(rawSource) {
     this._serverSource = rawSource;
-    if (rawSource === 'esp32' || rawSource === 'wifi' || rawSource === 'live') {
+    // The server sends source as "esp32", "wifi:<SSID>", "simulated", etc.
+    // Use startsWith for wifi since the SSID is appended after the colon.
+    if (rawSource === 'esp32' || rawSource === 'wifi' || rawSource.startsWith('wifi:') || rawSource === 'live') {
       this._setDataSource('live');
     } else if (rawSource === 'simulated' || rawSource === 'simulate') {
       this._setDataSource('server-simulated');

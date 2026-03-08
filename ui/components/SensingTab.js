@@ -215,8 +215,17 @@ export class SensingTab {
     if (banner) {
       // Map the service's dataSource to banner text and CSS modifier class.
       const dataSource = sensingService.dataSource;
+      const serverSource = sensingService.serverSource || '';
+      // Determine live banner text based on actual hardware source
+      let liveText = 'LIVE \u2014 ESP32 HARDWARE';
+      if (serverSource.startsWith('wifi:')) {
+        const ssid = serverSource.slice(5) || 'WiFi';
+        liveText = 'LIVE \u2014 WiFi (' + ssid + ')';
+      } else if (serverSource === 'wifi') {
+        liveText = 'LIVE \u2014 WiFi';
+      }
       const bannerConfig = {
-        'live':              { text: 'LIVE \u2014 ESP32 HARDWARE',           cls: 'sensing-source-live' },
+        'live':              { text: liveText,                              cls: 'sensing-source-live' },
         'server-simulated':  { text: 'SIMULATED \u2014 NO HARDWARE',        cls: 'sensing-source-server-sim' },
         'reconnecting':      { text: 'RECONNECTING...',                    cls: 'sensing-source-reconnecting' },
         'simulated':         { text: 'OFFLINE \u2014 CLIENT SIMULATION',    cls: 'sensing-source-simulated' },
