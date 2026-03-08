@@ -52,6 +52,14 @@ use wifi_densepose_wifiscan::{
 };
 use wifi_densepose_wifiscan::parse_netsh_output as parse_netsh_bssid_output;
 
+// macOS CoreWLAN scanner (ADR-025)
+#[cfg(target_os = "macos")]
+use wifi_densepose_wifiscan::{MacosCoreWlanScanner, parse_macos_scan_output};
+
+// Linux iw scanner
+#[cfg(target_os = "linux")]
+use wifi_densepose_wifiscan::{LinuxIwScanner, parse_iw_scan_output};
+
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
@@ -81,7 +89,7 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1", env = "SENSING_BIND_ADDR")]
     bind_addr: String,
 
-    /// Data source: auto, wifi, esp32, simulate
+    /// Data source: auto, wifi (Windows/macOS/Linux), esp32, simulate
     #[arg(long, default_value = "auto")]
     source: String,
 
@@ -1456,6 +1464,834 @@ async fn probe_esp32(port: u16) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Cross-platform native WiFi probe.
+///
+/// Dispatches to the appropriate platform-specific probe:
+/// - Windows: `netsh wlan show interfaces`
+/// - macOS: `airport -I` or `system_profiler`
+/// - Linux: `iw dev`
+async fn probe_native_wifi() -> bool {
+    // Windows probe (always compiled, returns false on non-Windows)
+    if probe_windows_wifi().await {
+        return true;
+    }
+
+    #[cfg(target_os = "macos")]
+    if probe_macos_wifi().await {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    if probe_linux_wifi().await {
+        return true;
+    }
+
+    false
+}
+
+// ── macOS WiFi scanning ──────────────────────────────────────────────────────
+
+/// Probe if macOS WiFi is available and connected.
+///
+/// Uses `system_profiler SPAirPortDataType` which works on all macOS versions
+/// and doesn't require special entitlements. Returns true if a connected
+/// WiFi interface is detected.
+#[cfg(target_os = "macos")]
+async fn probe_macos_wifi() -> bool {
+    // First try: check if airport binary exists (pre-Sonoma 14.4)
+    let airport_exists = tokio::process::Command::new("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport")
+        .arg("-I")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if airport_exists {
+        return true;
+    }
+
+    // Fallback: system_profiler (always available)
+    match tokio::process::Command::new("system_profiler")
+        .arg("SPAirPortDataType")
+        .output()
+        .await
+    {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            out.contains("Status: Connected") || out.contains("Current Network Information:")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Parse the output of macOS `airport -I` (interface info) to extract RSSI, noise, and SSID.
+///
+/// Returns `(rssi_dbm, signal_pct, ssid)`.
+#[cfg(target_os = "macos")]
+fn parse_airport_interface_output(output: &str) -> Option<(f64, f64, String)> {
+    let mut rssi = None;
+    let mut noise = None;
+    let mut ssid = None;
+
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("agrCtlRSSI:") {
+            rssi = rest.trim().parse::<f64>().ok();
+        } else if let Some(rest) = line.strip_prefix("agrCtlNoise:") {
+            noise = rest.trim().parse::<f64>().ok();
+        } else if let Some(rest) = line.strip_prefix("SSID:") {
+            ssid = Some(rest.trim().to_string());
+        }
+    }
+
+    let r = rssi?;
+    // Convert RSSI to signal percentage: clamp to 0-100 range.
+    let signal = ((r + 100.0) * 2.0).clamp(0.0, 100.0);
+    Some((r, signal, ssid.unwrap_or_else(|| "Unknown".into())))
+}
+
+/// Parse `system_profiler SPAirPortDataType` output for basic WiFi info.
+///
+/// This is the fallback when `airport` CLI is unavailable (macOS Sonoma 14.4+).
+/// Returns `(rssi_dbm, signal_pct, ssid)`.
+#[cfg(target_os = "macos")]
+fn parse_system_profiler_wifi_output(output: &str) -> Option<(f64, f64, String)> {
+    let mut ssid = None;
+    let mut rssi = None;
+
+    let mut in_current_network = false;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("Current Network Information:") {
+            in_current_network = true;
+            continue;
+        }
+        if in_current_network {
+            // The SSID appears as a key in the next line, e.g. "MyNetwork:"
+            if ssid.is_none() && trimmed.ends_with(':') && !trimmed.contains("PHY Mode")
+                && !trimmed.starts_with("Status") && !trimmed.starts_with("Security")
+            {
+                ssid = Some(trimmed.trim_end_matches(':').to_string());
+            }
+            if let Some(rest) = trimmed.strip_prefix("Signal / Noise:") {
+                // "Signal / Noise: -52 dBm / -90 dBm"
+                let parts: Vec<&str> = rest.split('/').collect();
+                if let Some(sig) = parts.first() {
+                    let num: String = sig.chars().filter(|c| c.is_ascii_digit() || *c == '-').collect();
+                    rssi = num.parse::<f64>().ok();
+                }
+            }
+        }
+    }
+
+    let r = rssi.unwrap_or(-70.0);
+    let signal = ((r + 100.0) * 2.0).clamp(0.0, 100.0);
+    Some((r, signal, ssid.unwrap_or_else(|| "Unknown".into())))
+}
+
+/// macOS WiFi scanning task using the `airport` CLI or `mac_wifi` Swift helper.
+///
+/// Tries multi-BSSID scanning first via the CoreWLAN scanner (which requires
+/// the `mac_wifi` Swift helper binary). Falls back to single-AP `airport -I`
+/// or `system_profiler` for basic RSSI monitoring.
+#[cfg(target_os = "macos")]
+async fn macos_wifi_task(state: SharedState, tick_ms: u64) {
+    let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
+    let mut seq: u32 = 0;
+
+    // Try multi-BSSID pipeline (reuses the same pipeline as Windows)
+    let mut registry = BssidRegistry::new(32, 30);
+    let mut pipeline = WindowsWifiPipeline::new();
+
+    // Check which scanner backend is available
+    let has_mac_wifi_helper = tokio::task::spawn_blocking(|| {
+        std::process::Command::new("mac_wifi")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }).await.unwrap_or(false);
+
+    let airport_path = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport";
+    let has_airport = tokio::fs::metadata(airport_path).await.is_ok();
+
+    if has_mac_wifi_helper {
+        info!("macOS WiFi multi-BSSID pipeline active via mac_wifi helper (tick={}ms)", tick_ms);
+    } else if has_airport {
+        info!("macOS WiFi single-AP mode via airport CLI (tick={}ms)", tick_ms);
+    } else {
+        info!("macOS WiFi single-AP mode via system_profiler (tick={}ms)", tick_ms);
+    }
+
+    loop {
+        interval.tick().await;
+        seq += 1;
+
+        // ── Try multi-BSSID scan via mac_wifi helper ──────────────────
+        if has_mac_wifi_helper {
+            let scan_result = tokio::task::spawn_blocking(|| {
+                let output = std::process::Command::new("mac_wifi")
+                    .arg("--scan-once")
+                    .output()
+                    .map_err(|e| format!("mac_wifi scan failed: {e}"))?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!("mac_wifi exited with {}: {}", output.status, stderr.trim()));
+                }
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                parse_macos_scan_output(&stdout).map_err(|e| format!("parse error: {e}"))
+            }).await;
+
+            match scan_result {
+                Ok(Ok(obs)) if !obs.is_empty() => {
+                    let obs_count = obs.len();
+                    let ssid = obs.first().map(|o| o.ssid.clone()).unwrap_or_else(|| "Unknown".into());
+                    let first_rssi = obs.first().map(|o| o.rssi_dbm).unwrap_or(-80.0);
+
+                    registry.update(&obs);
+                    let multi_ap_frame = registry.to_multi_ap_frame();
+                    let enhanced = pipeline.process(&multi_ap_frame);
+
+                    let frame = Esp32Frame {
+                        magic: 0xC511_0001,
+                        node_id: 0,
+                        n_antennas: 1,
+                        n_subcarriers: obs_count.min(255) as u8,
+                        freq_mhz: 2437,
+                        sequence: seq,
+                        rssi: first_rssi.clamp(-128.0, 127.0) as i8,
+                        noise_floor: -90,
+                        amplitudes: multi_ap_frame.amplitudes.clone(),
+                        phases: multi_ap_frame.phases.clone(),
+                    };
+
+                    let mut s = state.write().await;
+                    s.frame_history.push_back(frame.amplitudes.clone());
+                    if s.frame_history.len() > FRAME_HISTORY_CAPACITY {
+                        s.frame_history.pop_front();
+                    }
+                    let sample_rate_hz = 1000.0 / tick_ms as f64;
+                    let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
+                        extract_features_from_frame(&frame, &s.frame_history, sample_rate_hz);
+                    smooth_and_classify(&mut s, &mut classification, raw_motion);
+                    adaptive_override(&s, &features, &mut classification);
+
+                    let enhanced_motion = Some(serde_json::json!({
+                        "score": enhanced.motion.score,
+                        "level": format!("{:?}", enhanced.motion.level),
+                        "contributing_bssids": enhanced.motion.contributing_bssids,
+                    }));
+                    let enhanced_breathing = enhanced.breathing.as_ref().map(|b| {
+                        serde_json::json!({
+                            "rate_bpm": b.rate_bpm,
+                            "confidence": b.confidence,
+                            "bssid_count": b.bssid_count,
+                        })
+                    });
+                    let posture_str = enhanced.posture.map(|p| format!("{p:?}"));
+                    let sig_quality_score = Some(enhanced.signal_quality.score);
+                    let verdict_str = Some(format!("{:?}", enhanced.verdict));
+                    let bssid_n = Some(enhanced.bssid_count);
+
+                    s.source = format!("wifi:{ssid}");
+                    s.rssi_history.push_back(first_rssi);
+                    if s.rssi_history.len() > 60 {
+                        s.rssi_history.pop_front();
+                    }
+                    s.tick += 1;
+                    let tick = s.tick;
+
+                    let motion_score = if classification.motion_level == "active" {
+                        0.8
+                    } else if classification.motion_level == "present_still" {
+                        0.3
+                    } else {
+                        0.05
+                    };
+
+                    let raw_vitals = s.vital_detector.process_frame(&frame.amplitudes, &frame.phases);
+                    let vitals = smooth_vitals(&mut s, &raw_vitals);
+                    s.latest_vitals = vitals.clone();
+
+                    let feat_variance = features.variance;
+                    let raw_score = compute_person_score(&features);
+                    s.smoothed_person_score = s.smoothed_person_score * 0.85 + raw_score * 0.15;
+                    let est_persons = if classification.presence {
+                        score_to_person_count(s.smoothed_person_score)
+                    } else {
+                        0
+                    };
+
+                    let mut update = SensingUpdate {
+                        msg_type: "sensing_update".to_string(),
+                        timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+                        source: format!("wifi:{ssid}"),
+                        tick,
+                        nodes: vec![NodeInfo {
+                            node_id: 0,
+                            rssi_dbm: first_rssi,
+                            position: [0.0, 0.0, 0.0],
+                            amplitude: multi_ap_frame.amplitudes,
+                            subcarrier_count: obs_count,
+                        }],
+                        features,
+                        classification,
+                        signal_field: generate_signal_field(
+                            first_rssi, motion_score, breathing_rate_hz,
+                            feat_variance.min(1.0), &sub_variances,
+                        ),
+                        vital_signs: Some(vitals),
+                        enhanced_motion,
+                        enhanced_breathing,
+                        posture: posture_str,
+                        signal_quality_score: sig_quality_score,
+                        quality_verdict: verdict_str,
+                        bssid_count: bssid_n,
+                        pose_keypoints: None,
+                        model_status: None,
+                        persons: None,
+                        estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
+                    };
+
+                    let persons = derive_pose_from_sensing(&update);
+                    if !persons.is_empty() {
+                        update.persons = Some(persons);
+                    }
+
+                    if let Ok(json) = serde_json::to_string(&update) {
+                        let _ = s.tx.send(json);
+                    }
+                    s.latest_update = Some(update);
+
+                    debug!("macOS multi-BSSID tick #{tick}: {obs_count} BSSIDs");
+                    continue;
+                }
+                _ => {
+                    // Fall through to single-AP fallback
+                }
+            }
+        }
+
+        // ── Fallback: single-AP via airport or system_profiler ────────
+        macos_wifi_fallback_tick(&state, seq, tick_ms, has_airport).await;
+    }
+}
+
+/// Fallback single-AP WiFi data collection on macOS.
+///
+/// Uses `airport -I` (pre-Sonoma) or `system_profiler SPAirPortDataType`
+/// (all macOS versions) to get basic RSSI and SSID info.
+#[cfg(target_os = "macos")]
+async fn macos_wifi_fallback_tick(state: &SharedState, seq: u32, tick_ms: u64, has_airport: bool) {
+    let airport_path = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport";
+
+    let (rssi_dbm, signal_pct, ssid) = if has_airport {
+        // Use airport -I for fast single-AP info
+        let output = match tokio::process::Command::new(airport_path)
+            .arg("-I")
+            .output()
+            .await
+        {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+            Err(e) => {
+                warn!("airport -I failed: {e}");
+                return;
+            }
+        };
+        match parse_airport_interface_output(&output) {
+            Some(v) => v,
+            None => {
+                debug!("Fallback: no WiFi interface connected (airport)");
+                return;
+            }
+        }
+    } else {
+        // Use system_profiler (slower but always available)
+        let output = match tokio::process::Command::new("system_profiler")
+            .arg("SPAirPortDataType")
+            .output()
+            .await
+        {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+            Err(e) => {
+                warn!("system_profiler failed: {e}");
+                return;
+            }
+        };
+        match parse_system_profiler_wifi_output(&output) {
+            Some(v) => v,
+            None => {
+                debug!("Fallback: no WiFi connected (system_profiler)");
+                return;
+            }
+        }
+    };
+
+    let frame = Esp32Frame {
+        magic: 0xC511_0001,
+        node_id: 0,
+        n_antennas: 1,
+        n_subcarriers: 1,
+        freq_mhz: 2437,
+        sequence: seq,
+        rssi: rssi_dbm as i8,
+        noise_floor: -90,
+        amplitudes: vec![signal_pct],
+        phases: vec![0.0],
+    };
+
+    let mut s = state.write().await;
+    s.frame_history.push_back(frame.amplitudes.clone());
+    if s.frame_history.len() > FRAME_HISTORY_CAPACITY {
+        s.frame_history.pop_front();
+    }
+    let sample_rate_hz = 1000.0 / tick_ms as f64;
+    let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
+        extract_features_from_frame(&frame, &s.frame_history, sample_rate_hz);
+    smooth_and_classify(&mut s, &mut classification, raw_motion);
+    adaptive_override(&s, &features, &mut classification);
+
+    s.source = format!("wifi:{ssid}");
+    s.rssi_history.push_back(rssi_dbm);
+    if s.rssi_history.len() > 60 {
+        s.rssi_history.pop_front();
+    }
+
+    s.tick += 1;
+    let tick = s.tick;
+
+    let motion_score = if classification.motion_level == "active" {
+        0.8
+    } else if classification.motion_level == "present_still" {
+        0.3
+    } else {
+        0.05
+    };
+
+    let raw_vitals = s.vital_detector.process_frame(&frame.amplitudes, &frame.phases);
+    let vitals = smooth_vitals(&mut s, &raw_vitals);
+    s.latest_vitals = vitals.clone();
+
+    let feat_variance = features.variance;
+    let raw_score = compute_person_score(&features);
+    s.smoothed_person_score = s.smoothed_person_score * 0.85 + raw_score * 0.15;
+    let est_persons = if classification.presence {
+        score_to_person_count(s.smoothed_person_score)
+    } else {
+        0
+    };
+
+    let mut update = SensingUpdate {
+        msg_type: "sensing_update".to_string(),
+        timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+        source: format!("wifi:{ssid}"),
+        tick,
+        nodes: vec![NodeInfo {
+            node_id: 0,
+            rssi_dbm,
+            position: [0.0, 0.0, 0.0],
+            amplitude: vec![signal_pct],
+            subcarrier_count: 1,
+        }],
+        features,
+        classification,
+        signal_field: generate_signal_field(
+            rssi_dbm, motion_score, breathing_rate_hz,
+            feat_variance.min(1.0), &sub_variances,
+        ),
+        vital_signs: Some(vitals),
+        enhanced_motion: None,
+        enhanced_breathing: None,
+        posture: None,
+        signal_quality_score: None,
+        quality_verdict: None,
+        bssid_count: None,
+        pose_keypoints: None,
+        model_status: None,
+        persons: None,
+        estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
+    };
+
+    let persons = derive_pose_from_sensing(&update);
+    if !persons.is_empty() {
+        update.persons = Some(persons);
+    }
+
+    if let Ok(json) = serde_json::to_string(&update) {
+        let _ = s.tx.send(json);
+    }
+    s.latest_update = Some(update);
+}
+
+// ── Linux WiFi scanning ─────────────────────────────────────────────────────
+
+/// Probe if Linux WiFi is available via `iw`.
+#[cfg(target_os = "linux")]
+async fn probe_linux_wifi() -> bool {
+    // Check if iw is available and there's a wireless interface
+    match tokio::process::Command::new("iw")
+        .args(["dev"])
+        .output()
+        .await
+    {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            // iw dev output contains "Interface <name>" for each wireless interface
+            out.contains("Interface ")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Detect the first wireless interface name on Linux.
+#[cfg(target_os = "linux")]
+fn detect_linux_wifi_interface(iw_dev_output: &str) -> Option<String> {
+    for line in iw_dev_output.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Interface ") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Parse output of `iwconfig <iface>` or `iw dev <iface> link` for basic WiFi info.
+///
+/// Returns `(rssi_dbm, signal_pct, ssid)`.
+#[cfg(target_os = "linux")]
+fn parse_iw_link_output(output: &str) -> Option<(f64, f64, String)> {
+    let mut ssid = None;
+    let mut rssi = None;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("SSID:") {
+            ssid = Some(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("signal:") {
+            // "signal: -52 dBm"
+            let num: String = rest.chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '.' || *c == ' ')
+                .collect();
+            rssi = num.trim().parse::<f64>().ok();
+        }
+    }
+
+    let r = rssi?;
+    let signal = ((r + 100.0) * 2.0).clamp(0.0, 100.0);
+    Some((r, signal, ssid.unwrap_or_else(|| "Unknown".into())))
+}
+
+/// Linux WiFi scanning task using `iw` commands.
+///
+/// Tries multi-BSSID scanning via `iw dev <iface> scan dump` first.
+/// Falls back to `iw dev <iface> link` for single-AP RSSI monitoring.
+#[cfg(target_os = "linux")]
+async fn linux_wifi_task(state: SharedState, tick_ms: u64) {
+    let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
+    let mut seq: u32 = 0;
+
+    let mut registry = BssidRegistry::new(32, 30);
+    let mut pipeline = WindowsWifiPipeline::new();
+
+    // Detect wireless interface
+    let iface = match tokio::process::Command::new("iw").arg("dev").output().await {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout).to_string();
+            detect_linux_wifi_interface(&out).unwrap_or_else(|| "wlan0".to_string())
+        }
+        Err(_) => "wlan0".to_string(),
+    };
+
+    // Check if we can do full scans (requires root / CAP_NET_ADMIN)
+    let can_scan = tokio::process::Command::new("iw")
+        .args(["dev", &iface, "scan", "dump"])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if can_scan {
+        info!("Linux WiFi multi-BSSID mode via iw scan dump on {} (tick={}ms)", iface, tick_ms);
+    } else {
+        info!("Linux WiFi single-AP mode via iw link on {} (tick={}ms)", iface, tick_ms);
+    }
+
+    loop {
+        interval.tick().await;
+        seq += 1;
+
+        if can_scan {
+            // Try multi-BSSID scan dump
+            let iface_clone = iface.clone();
+            let scan_result = tokio::task::spawn_blocking(move || {
+                let output = std::process::Command::new("iw")
+                    .args(["dev", &iface_clone, "scan", "dump"])
+                    .output()
+                    .map_err(|e| format!("iw scan dump failed: {e}"))?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!("iw exited with {}: {}", output.status, stderr.trim()));
+                }
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                parse_iw_scan_output(&stdout).map_err(|e| format!("parse error: {e}"))
+            }).await;
+
+            match scan_result {
+                Ok(Ok(obs)) if !obs.is_empty() => {
+                    let obs_count = obs.len();
+                    let ssid = obs.first().map(|o| o.ssid.clone()).unwrap_or_else(|| "Unknown".into());
+                    let first_rssi = obs.first().map(|o| o.rssi_dbm).unwrap_or(-80.0);
+
+                    registry.update(&obs);
+                    let multi_ap_frame = registry.to_multi_ap_frame();
+                    let enhanced = pipeline.process(&multi_ap_frame);
+
+                    let frame = Esp32Frame {
+                        magic: 0xC511_0001,
+                        node_id: 0,
+                        n_antennas: 1,
+                        n_subcarriers: obs_count.min(255) as u8,
+                        freq_mhz: 2437,
+                        sequence: seq,
+                        rssi: first_rssi.clamp(-128.0, 127.0) as i8,
+                        noise_floor: -90,
+                        amplitudes: multi_ap_frame.amplitudes.clone(),
+                        phases: multi_ap_frame.phases.clone(),
+                    };
+
+                    let mut s = state.write().await;
+                    s.frame_history.push_back(frame.amplitudes.clone());
+                    if s.frame_history.len() > FRAME_HISTORY_CAPACITY {
+                        s.frame_history.pop_front();
+                    }
+                    let sample_rate_hz = 1000.0 / tick_ms as f64;
+                    let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
+                        extract_features_from_frame(&frame, &s.frame_history, sample_rate_hz);
+                    smooth_and_classify(&mut s, &mut classification, raw_motion);
+                    adaptive_override(&s, &features, &mut classification);
+
+                    let enhanced_motion = Some(serde_json::json!({
+                        "score": enhanced.motion.score,
+                        "level": format!("{:?}", enhanced.motion.level),
+                        "contributing_bssids": enhanced.motion.contributing_bssids,
+                    }));
+                    let enhanced_breathing = enhanced.breathing.as_ref().map(|b| {
+                        serde_json::json!({
+                            "rate_bpm": b.rate_bpm,
+                            "confidence": b.confidence,
+                            "bssid_count": b.bssid_count,
+                        })
+                    });
+                    let posture_str = enhanced.posture.map(|p| format!("{p:?}"));
+                    let sig_quality_score = Some(enhanced.signal_quality.score);
+                    let verdict_str = Some(format!("{:?}", enhanced.verdict));
+                    let bssid_n = Some(enhanced.bssid_count);
+
+                    s.source = format!("wifi:{ssid}");
+                    s.rssi_history.push_back(first_rssi);
+                    if s.rssi_history.len() > 60 {
+                        s.rssi_history.pop_front();
+                    }
+                    s.tick += 1;
+                    let tick = s.tick;
+
+                    let motion_score = if classification.motion_level == "active" {
+                        0.8
+                    } else if classification.motion_level == "present_still" {
+                        0.3
+                    } else {
+                        0.05
+                    };
+
+                    let raw_vitals = s.vital_detector.process_frame(&frame.amplitudes, &frame.phases);
+                    let vitals = smooth_vitals(&mut s, &raw_vitals);
+                    s.latest_vitals = vitals.clone();
+
+                    let feat_variance = features.variance;
+                    let raw_score = compute_person_score(&features);
+                    s.smoothed_person_score = s.smoothed_person_score * 0.85 + raw_score * 0.15;
+                    let est_persons = if classification.presence {
+                        score_to_person_count(s.smoothed_person_score)
+                    } else {
+                        0
+                    };
+
+                    let mut update = SensingUpdate {
+                        msg_type: "sensing_update".to_string(),
+                        timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+                        source: format!("wifi:{ssid}"),
+                        tick,
+                        nodes: vec![NodeInfo {
+                            node_id: 0,
+                            rssi_dbm: first_rssi,
+                            position: [0.0, 0.0, 0.0],
+                            amplitude: multi_ap_frame.amplitudes,
+                            subcarrier_count: obs_count,
+                        }],
+                        features,
+                        classification,
+                        signal_field: generate_signal_field(
+                            first_rssi, motion_score, breathing_rate_hz,
+                            feat_variance.min(1.0), &sub_variances,
+                        ),
+                        vital_signs: Some(vitals),
+                        enhanced_motion,
+                        enhanced_breathing,
+                        posture: posture_str,
+                        signal_quality_score: sig_quality_score,
+                        quality_verdict: verdict_str,
+                        bssid_count: bssid_n,
+                        pose_keypoints: None,
+                        model_status: None,
+                        persons: None,
+                        estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
+                    };
+
+                    let persons = derive_pose_from_sensing(&update);
+                    if !persons.is_empty() {
+                        update.persons = Some(persons);
+                    }
+
+                    if let Ok(json) = serde_json::to_string(&update) {
+                        let _ = s.tx.send(json);
+                    }
+                    s.latest_update = Some(update);
+
+                    debug!("Linux multi-BSSID tick #{tick}: {obs_count} BSSIDs");
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        // Fallback: single-AP via iw dev <iface> link
+        linux_wifi_fallback_tick(&state, seq, tick_ms, &iface).await;
+    }
+}
+
+/// Fallback single-AP WiFi data collection on Linux via `iw dev <iface> link`.
+#[cfg(target_os = "linux")]
+async fn linux_wifi_fallback_tick(state: &SharedState, seq: u32, tick_ms: u64, iface: &str) {
+    let output = match tokio::process::Command::new("iw")
+        .args(["dev", iface, "link"])
+        .output()
+        .await
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(e) => {
+            warn!("iw link failed: {e}");
+            return;
+        }
+    };
+
+    let (rssi_dbm, signal_pct, ssid) = match parse_iw_link_output(&output) {
+        Some(v) => v,
+        None => {
+            debug!("Fallback: no WiFi connected (iw link)");
+            return;
+        }
+    };
+
+    let frame = Esp32Frame {
+        magic: 0xC511_0001,
+        node_id: 0,
+        n_antennas: 1,
+        n_subcarriers: 1,
+        freq_mhz: 2437,
+        sequence: seq,
+        rssi: rssi_dbm as i8,
+        noise_floor: -90,
+        amplitudes: vec![signal_pct],
+        phases: vec![0.0],
+    };
+
+    let mut s = state.write().await;
+    s.frame_history.push_back(frame.amplitudes.clone());
+    if s.frame_history.len() > FRAME_HISTORY_CAPACITY {
+        s.frame_history.pop_front();
+    }
+    let sample_rate_hz = 1000.0 / tick_ms as f64;
+    let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
+        extract_features_from_frame(&frame, &s.frame_history, sample_rate_hz);
+    smooth_and_classify(&mut s, &mut classification, raw_motion);
+    adaptive_override(&s, &features, &mut classification);
+
+    s.source = format!("wifi:{ssid}");
+    s.rssi_history.push_back(rssi_dbm);
+    if s.rssi_history.len() > 60 {
+        s.rssi_history.pop_front();
+    }
+
+    s.tick += 1;
+    let tick = s.tick;
+
+    let motion_score = if classification.motion_level == "active" {
+        0.8
+    } else if classification.motion_level == "present_still" {
+        0.3
+    } else {
+        0.05
+    };
+
+    let raw_vitals = s.vital_detector.process_frame(&frame.amplitudes, &frame.phases);
+    let vitals = smooth_vitals(&mut s, &raw_vitals);
+    s.latest_vitals = vitals.clone();
+
+    let feat_variance = features.variance;
+    let raw_score = compute_person_score(&features);
+    s.smoothed_person_score = s.smoothed_person_score * 0.85 + raw_score * 0.15;
+    let est_persons = if classification.presence {
+        score_to_person_count(s.smoothed_person_score)
+    } else {
+        0
+    };
+
+    let mut update = SensingUpdate {
+        msg_type: "sensing_update".to_string(),
+        timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+        source: format!("wifi:{ssid}"),
+        tick,
+        nodes: vec![NodeInfo {
+            node_id: 0,
+            rssi_dbm,
+            position: [0.0, 0.0, 0.0],
+            amplitude: vec![signal_pct],
+            subcarrier_count: 1,
+        }],
+        features,
+        classification,
+        signal_field: generate_signal_field(
+            rssi_dbm, motion_score, breathing_rate_hz,
+            feat_variance.min(1.0), &sub_variances,
+        ),
+        vital_signs: Some(vitals),
+        enhanced_motion: None,
+        enhanced_breathing: None,
+        posture: None,
+        signal_quality_score: None,
+        quality_verdict: None,
+        bssid_count: None,
+        pose_keypoints: None,
+        model_status: None,
+        persons: None,
+        estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
+    };
+
+    let persons = derive_pose_from_sensing(&update);
+    if !persons.is_empty() {
+        update.persons = Some(persons);
+    }
+
+    if let Ok(json) = serde_json::to_string(&update) {
+        let _ = s.tx.send(json);
+    }
+    s.latest_update = Some(update);
 }
 
 // ── Simulated data generator ─────────────────────────────────────────────────
@@ -3458,15 +4294,15 @@ async fn main() {
     info!("  UI path:   {}", args.ui_path.display());
     info!("  Source:    {}", args.source);
 
-    // Auto-detect data source
+    // Auto-detect data source (cross-platform: Windows, macOS, Linux)
     let source = match args.source.as_str() {
         "auto" => {
             info!("Auto-detecting data source...");
             if probe_esp32(args.udp_port).await {
                 info!("  ESP32 CSI detected on UDP :{}", args.udp_port);
                 "esp32"
-            } else if probe_windows_wifi().await {
-                info!("  Windows WiFi detected");
+            } else if probe_native_wifi().await {
+                info!("  Native WiFi detected");
                 "wifi"
             } else {
                 info!("  No hardware detected, using simulation");
@@ -3610,14 +4446,32 @@ async fn main() {
         }),
     }));
 
-    // Start background tasks based on source
+    // Start background tasks based on source (cross-platform WiFi dispatch)
     match source {
         "esp32" => {
             tokio::spawn(udp_receiver_task(state.clone(), args.udp_port));
             tokio::spawn(broadcast_tick_task(state.clone(), args.tick_ms));
         }
         "wifi" => {
-            tokio::spawn(windows_wifi_task(state.clone(), args.tick_ms));
+            // Dispatch to the correct platform WiFi task
+            #[cfg(target_os = "macos")]
+            {
+                tokio::spawn(macos_wifi_task(state.clone(), args.tick_ms));
+            }
+            #[cfg(target_os = "linux")]
+            {
+                tokio::spawn(linux_wifi_task(state.clone(), args.tick_ms));
+            }
+            #[cfg(target_os = "windows")]
+            {
+                tokio::spawn(windows_wifi_task(state.clone(), args.tick_ms));
+            }
+            // Fallback for other platforms: try Windows task (will fail gracefully
+            // to simulated if netsh is unavailable)
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            {
+                tokio::spawn(windows_wifi_task(state.clone(), args.tick_ms));
+            }
         }
         _ => {
             tokio::spawn(simulated_data_task(state.clone(), args.tick_ms));
